@@ -15,6 +15,9 @@ export const DEFAULT_SETTINGS: DriveEmbedderSettings = {
     // Drive settings
     driveFolder: 'Obsidian/DriveEmbedder',
 
+    // Clipboard
+    uploadPastedImages: false,
+
     // Embed settings
     showTitleByDefault: true,
     defaultTheme: 'auto',

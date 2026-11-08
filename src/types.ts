@@ -68,6 +68,9 @@ export interface DriveEmbedderSettings {
     // Drive settings
     driveFolder: string;
 
+    // Clipboard: intercept pasted images and offer to upload them to Google Drive
+    uploadPastedImages: boolean;
+
     // Embed settings
     showTitleByDefault: boolean;
     defaultTheme: 'light' | 'dark' | 'auto';

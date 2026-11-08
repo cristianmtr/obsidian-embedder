@@ -3,13 +3,24 @@
  * Upload local files to Google Drive and embed them in Obsidian notes
  */
 
-import { Plugin, PluginSettingTab, App, Setting, Notice, Editor, MarkdownView } from 'obsidian';
+import { Plugin, PluginSettingTab, App, Setting, Notice, Editor, MarkdownView, MarkdownFileInfo } from 'obsidian';
 import { DriveEmbedderSettings } from './src/types';
 import { DEFAULT_SETTINGS } from './src/settings';
 import { GoogleOAuthFlow } from './src/google-oauth-flow';
 import { GoogleDriveUploader } from './src/uploader';
 import { UploadModal, UploadModalResult } from './src/upload-modal';
 import { EmbedGenerator } from './src/embed-generator';
+import { PasteChoiceModal } from './src/paste-choice-modal';
+import { getFileTypeInfo, getSizeById } from './src/size-presets';
+
+// File extension for each image MIME type that Drive Embedder supports
+const IMAGE_EXTENSIONS: Record<string, string> = {
+    'image/png': '.png',
+    'image/jpeg': '.jpg',
+    'image/gif': '.gif',
+    'image/webp': '.webp',
+    'image/svg+xml': '.svg'
+};
 
 export default class DriveEmbedderPlugin extends Plugin {
     settings: DriveEmbedderSettings;
@@ -38,6 +49,13 @@ export default class DriveEmbedderPlugin extends Plugin {
                 this.openUploadModal(editor);
             }
         });
+
+        // Intercept pasted images (only when the setting is on)
+        this.registerEvent(
+            this.app.workspace.on('editor-paste', (evt, editor, info) => {
+                this.handleEditorPaste(evt, editor, info);
+            })
+        );
 
         // Add settings tab
         this.addSettingTab(new DriveEmbedderSettingTab(this.app, this));
@@ -119,6 +137,103 @@ export default class DriveEmbedderPlugin extends Plugin {
 
     isConnected(): boolean {
         return !!this.settings.googleAccessToken && !!this.uploader;
+    }
+
+    /**
+     * Handle a paste in the editor. When the setting is on and the clipboard
+     * holds image files, stop Obsidian's default paste and ask the user where
+     * the images go: Google Drive (insert an embed) or the vault (insert a link).
+     */
+    private handleEditorPaste(evt: ClipboardEvent, editor: Editor, info: MarkdownView | MarkdownFileInfo) {
+        if (!this.settings.uploadPastedImages || evt.defaultPrevented) return;
+        if (!this.isConnected() || !this.uploader) return;
+
+        const images = Array.from(evt.clipboardData?.files ?? [])
+            .filter(file => file.type in IMAGE_EXTENSIONS);
+        if (images.length === 0) return;
+
+        evt.preventDefault();
+
+        const files = images.map((file, i) => this.renamePastedImage(file, i));
+        const sourcePath = info.file?.path ?? '';
+
+        void (async () => {
+            const choice = await new PasteChoiceModal(this.app, files.map(f => f.name)).choose();
+            if (choice === 'drive') {
+                for (const file of files) {
+                    await this.uploadPastedImage(file, editor);
+                }
+            } else if (choice === 'vault') {
+                await this.savePastedImagesInVault(files, editor, sourcePath);
+            }
+        })();
+    }
+
+    /** Give a clipboard image a unique name, like Obsidian does ("Pasted image 20261108140341.png"). */
+    private renamePastedImage(file: File, index: number): File {
+        const ext = IMAGE_EXTENSIONS[file.type];
+        const suffix = index > 0 ? `-${index}` : '';
+        const d = new Date();
+        const pad = (n: number) => String(n).padStart(2, '0');
+        const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+        const name = `Pasted image ${stamp}${suffix}${ext}`;
+        return new File([file], name, { type: file.type, lastModified: file.lastModified });
+    }
+
+    /** Upload one pasted image to Google Drive and replace a placeholder in the note with its embed. */
+    private async uploadPastedImage(file: File, editor: Editor) {
+        if (!this.uploader) return;
+
+        const placeholder = `![Uploading ${file.name}…]()`;
+        editor.replaceSelection(placeholder);
+
+        const notice = new Notice(`Uploading ${file.name}...`, 0);
+        const result = await this.uploader.uploadFile(file, this.settings.driveFolder, (progress) => {
+            notice.setMessage(`${file.name}: ${progress.message} ${Math.round(progress.progress)}%`);
+        });
+        notice.hide();
+
+        const fileInfo = getFileTypeInfo(file.name);
+        const embedCode = result && fileInfo
+            ? this.embedGenerator.generateEmbed(file.name, result, {
+                size: getSizeById(fileInfo.category, this.settings.defaultImageSize),
+                showTitle: this.settings.showTitleByDefault
+            })
+            : '';
+
+        if (!result) {
+            new Notice(`❌ upload failed: ${file.name}. See the developer console for details.`);
+        }
+
+        // Swap the placeholder for the embed (or remove it on failure)
+        const offset = editor.getValue().indexOf(placeholder);
+        if (offset >= 0) {
+            editor.replaceRange(
+                embedCode,
+                editor.offsetToPos(offset),
+                editor.offsetToPos(offset + placeholder.length)
+            );
+        } else if (embedCode) {
+            // The note changed during the upload and the placeholder is gone
+            await navigator.clipboard.writeText(embedCode);
+            new Notice('📋 embed code copied to clipboard!');
+        }
+
+        if (result) {
+            new Notice(`✅ uploaded ${file.name} to Google Drive.`);
+        }
+    }
+
+    /** Save pasted images as attachments in the vault and insert links, like Obsidian's default paste. */
+    private async savePastedImagesInVault(files: File[], editor: Editor, sourcePath: string) {
+        const links: string[] = [];
+        for (const file of files) {
+            const path = await this.app.fileManager.getAvailablePathForAttachment(file.name, sourcePath);
+            const created = await this.app.vault.createBinary(path, await file.arrayBuffer());
+            const link = this.app.fileManager.generateMarkdownLink(created, sourcePath);
+            links.push(link.startsWith('!') ? link : `!${link}`);
+        }
+        editor.replaceSelection(links.join('\n'));
     }
 
     private openUploadModal(editor?: Editor) {
@@ -279,6 +394,17 @@ class DriveEmbedderSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.driveFolder)
                 .onChange((value) => {
                     this.plugin.settings.driveFolder = value;
+                    void this.plugin.saveSettings();
+                })
+            );
+
+        new Setting(containerEl)
+            .setName('Upload pasted images')
+            .setDesc('when you paste an image into a note, ask whether to upload it to Google Drive or save it in the vault')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.uploadPastedImages)
+                .onChange((value) => {
+                    this.plugin.settings.uploadPastedImages = value;
                     void this.plugin.saveSettings();
                 })
             );

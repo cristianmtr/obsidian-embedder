@@ -37,7 +37,7 @@ __export(main_exports, {
   default: () => DriveEmbedderPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian4 = require("obsidian");
+var import_obsidian5 = require("obsidian");
 
 // src/settings.ts
 var DEFAULT_SETTINGS = {
@@ -49,6 +49,8 @@ var DEFAULT_SETTINGS = {
   tokenExpiresAt: 0,
   // Drive settings
   driveFolder: "Obsidian/DriveEmbedder",
+  // Clipboard
+  uploadPastedImages: false,
   // Embed settings
   showTitleByDefault: true,
   defaultTheme: "auto",
@@ -849,6 +851,10 @@ function getRecommendedSize(category) {
   const presets = getSizePresets(category);
   return presets.find((p) => p.recommended) || presets[0];
 }
+function getSizeById(category, sizeId) {
+  const presets = getSizePresets(category);
+  return presets.find((p) => p.id === sizeId) || getRecommendedSize(category);
+}
 var SUPPORTED_EXTENSIONS = SUPPORTED_FILE_TYPES.map((ft) => ft.extension);
 
 // src/upload-modal.ts
@@ -1254,8 +1260,64 @@ var EmbedGenerator = class {
   }
 };
 
+// src/paste-choice-modal.ts
+var import_obsidian4 = require("obsidian");
+var PasteChoiceModal = class extends import_obsidian4.Modal {
+  constructor(app, fileNames) {
+    super(app);
+    this.resolveChoice = null;
+    this.fileNames = fileNames;
+  }
+  /** Open the modal and resolve with the user's choice. Closing it counts as cancel. */
+  choose() {
+    return new Promise((resolve) => {
+      this.resolveChoice = resolve;
+      this.open();
+    });
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("drive-embedder-paste-modal");
+    const count = this.fileNames.length;
+    this.setTitle(count === 1 ? "Pasted image" : `Pasted ${count} images`);
+    contentEl.createEl("p", {
+      text: "Upload to Google Drive and insert an embed, or save in the vault as usual?"
+    });
+    const list = contentEl.createEl("ul");
+    this.fileNames.forEach((name) => list.createEl("li", { text: name }));
+    new import_obsidian4.Setting(contentEl).addButton(
+      (button) => button.setButtonText("Cancel").onClick(() => this.finish("cancel"))
+    ).addButton(
+      (button) => button.setButtonText("Save in vault").onClick(() => this.finish("vault"))
+    ).addButton(
+      (button) => button.setButtonText("Upload to Google Drive").setCta().onClick(() => this.finish("drive"))
+    );
+  }
+  finish(choice) {
+    this.settle(choice);
+    this.close();
+  }
+  settle(choice) {
+    const resolve = this.resolveChoice;
+    this.resolveChoice = null;
+    resolve == null ? void 0 : resolve(choice);
+  }
+  onClose() {
+    this.settle("cancel");
+    this.contentEl.empty();
+  }
+};
+
 // main.ts
-var DriveEmbedderPlugin = class extends import_obsidian4.Plugin {
+var IMAGE_EXTENSIONS = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+  "image/svg+xml": ".svg"
+};
+var DriveEmbedderPlugin = class extends import_obsidian5.Plugin {
   constructor() {
     super(...arguments);
     this.oauthFlow = null;
@@ -1275,6 +1337,11 @@ var DriveEmbedderPlugin = class extends import_obsidian4.Plugin {
         this.openUploadModal(editor);
       }
     });
+    this.registerEvent(
+      this.app.workspace.on("editor-paste", (evt, editor, info) => {
+        this.handleEditorPaste(evt, editor, info);
+      })
+    );
     this.addSettingTab(new DriveEmbedderSettingTab(this.app, this));
     console.debug("Drive Embedder loaded");
   }
@@ -1314,7 +1381,7 @@ var DriveEmbedderPlugin = class extends import_obsidian4.Plugin {
   }
   async startOAuthFlow() {
     if (!this.oauthFlow) {
-      new import_obsidian4.Notice("please enter Google OAuth settings first.");
+      new import_obsidian5.Notice("please enter Google OAuth settings first.");
       return false;
     }
     try {
@@ -1323,12 +1390,12 @@ var DriveEmbedderPlugin = class extends import_obsidian4.Plugin {
       this.settings.googleRefreshToken = tokens.refreshToken;
       this.settings.tokenExpiresAt = tokens.expiresAt;
       await this.saveSettings();
-      new import_obsidian4.Notice("\u2705 connected to Google Drive successfully!");
+      new import_obsidian5.Notice("\u2705 connected to Google Drive successfully!");
       return true;
     } catch (error) {
       console.error("OAuth flow failed:", error);
       const message = error instanceof Error ? error.message : String(error);
-      new import_obsidian4.Notice(`\u274C connection failed: ${message}`);
+      new import_obsidian5.Notice(`\u274C connection failed: ${message}`);
       return false;
     }
   }
@@ -1338,18 +1405,101 @@ var DriveEmbedderPlugin = class extends import_obsidian4.Plugin {
     this.settings.tokenExpiresAt = 0;
     this.uploader = null;
     await this.saveSettings();
-    new import_obsidian4.Notice("disconnected from Google Drive.");
+    new import_obsidian5.Notice("disconnected from Google Drive.");
   }
   isConnected() {
     return !!this.settings.googleAccessToken && !!this.uploader;
   }
+  /**
+   * Handle a paste in the editor. When the setting is on and the clipboard
+   * holds image files, stop Obsidian's default paste and ask the user where
+   * the images go: Google Drive (insert an embed) or the vault (insert a link).
+   */
+  handleEditorPaste(evt, editor, info) {
+    var _a, _b, _c, _d;
+    if (!this.settings.uploadPastedImages || evt.defaultPrevented)
+      return;
+    if (!this.isConnected() || !this.uploader)
+      return;
+    const images = Array.from((_b = (_a = evt.clipboardData) == null ? void 0 : _a.files) != null ? _b : []).filter((file) => file.type in IMAGE_EXTENSIONS);
+    if (images.length === 0)
+      return;
+    evt.preventDefault();
+    const files = images.map((file, i) => this.renamePastedImage(file, i));
+    const sourcePath = (_d = (_c = info.file) == null ? void 0 : _c.path) != null ? _d : "";
+    void (async () => {
+      const choice = await new PasteChoiceModal(this.app, files.map((f) => f.name)).choose();
+      if (choice === "drive") {
+        for (const file of files) {
+          await this.uploadPastedImage(file, editor);
+        }
+      } else if (choice === "vault") {
+        await this.savePastedImagesInVault(files, editor, sourcePath);
+      }
+    })();
+  }
+  /** Give a clipboard image a unique name, like Obsidian does ("Pasted image 20261108140341.png"). */
+  renamePastedImage(file, index) {
+    const ext = IMAGE_EXTENSIONS[file.type];
+    const suffix = index > 0 ? `-${index}` : "";
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    const name = `Pasted image ${stamp}${suffix}${ext}`;
+    return new File([file], name, { type: file.type, lastModified: file.lastModified });
+  }
+  /** Upload one pasted image to Google Drive and replace a placeholder in the note with its embed. */
+  async uploadPastedImage(file, editor) {
+    if (!this.uploader)
+      return;
+    const placeholder = `![Uploading ${file.name}\u2026]()`;
+    editor.replaceSelection(placeholder);
+    const notice = new import_obsidian5.Notice(`Uploading ${file.name}...`, 0);
+    const result = await this.uploader.uploadFile(file, this.settings.driveFolder, (progress) => {
+      notice.setMessage(`${file.name}: ${progress.message} ${Math.round(progress.progress)}%`);
+    });
+    notice.hide();
+    const fileInfo = getFileTypeInfo(file.name);
+    const embedCode = result && fileInfo ? this.embedGenerator.generateEmbed(file.name, result, {
+      size: getSizeById(fileInfo.category, this.settings.defaultImageSize),
+      showTitle: this.settings.showTitleByDefault
+    }) : "";
+    if (!result) {
+      new import_obsidian5.Notice(`\u274C upload failed: ${file.name}. See the developer console for details.`);
+    }
+    const offset = editor.getValue().indexOf(placeholder);
+    if (offset >= 0) {
+      editor.replaceRange(
+        embedCode,
+        editor.offsetToPos(offset),
+        editor.offsetToPos(offset + placeholder.length)
+      );
+    } else if (embedCode) {
+      await navigator.clipboard.writeText(embedCode);
+      new import_obsidian5.Notice("\u{1F4CB} embed code copied to clipboard!");
+    }
+    if (result) {
+      new import_obsidian5.Notice(`\u2705 uploaded ${file.name} to Google Drive.`);
+    }
+  }
+  /** Save pasted images as attachments in the vault and insert links, like Obsidian's default paste. */
+  async savePastedImagesInVault(files, editor, sourcePath) {
+    const links = [];
+    for (const file of files) {
+      const path = await this.app.fileManager.getAvailablePathForAttachment(file.name, sourcePath);
+      const created = await this.app.vault.createBinary(path, await file.arrayBuffer());
+      const link = this.app.fileManager.generateMarkdownLink(created, sourcePath);
+      links.push(link.startsWith("!") ? link : `!${link}`);
+    }
+    editor.replaceSelection(links.join("\n"));
+  }
   openUploadModal(editor) {
     if (!this.isConnected()) {
-      new import_obsidian4.Notice("please connect to Google Drive first (in settings).");
+      new import_obsidian5.Notice("please connect to Google Drive first (in settings).");
       return;
     }
     if (!this.uploader) {
-      new import_obsidian4.Notice("uploader initialization failed. please check settings.");
+      new import_obsidian5.Notice("uploader initialization failed. please check settings.");
       return;
     }
     new UploadModal(
@@ -1368,14 +1518,14 @@ var DriveEmbedderPlugin = class extends import_obsidian4.Plugin {
             editor.replaceSelection(embedCode);
           } else {
             await navigator.clipboard.writeText(embedCode);
-            new import_obsidian4.Notice("\u{1F4CB} embed code copied to clipboard!");
+            new import_obsidian5.Notice("\u{1F4CB} embed code copied to clipboard!");
           }
         })();
       }
     ).open();
   }
 };
-var DriveEmbedderSettingTab = class extends import_obsidian4.PluginSettingTab {
+var DriveEmbedderSettingTab = class extends import_obsidian5.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -1392,7 +1542,7 @@ var DriveEmbedderSettingTab = class extends import_obsidian4.PluginSettingTab {
   createConnectionSection(containerEl) {
     const connectionDiv = containerEl.createDiv({ cls: "drive-embedder-connection-section" });
     const isConnected = this.plugin.isConnected();
-    new import_obsidian4.Setting(connectionDiv).setName("Connection status").setHeading();
+    new import_obsidian5.Setting(connectionDiv).setName("Connection status").setHeading();
     const statusDiv = connectionDiv.createDiv({ cls: "connection-status" });
     if (isConnected) {
       statusDiv.createSpan({ cls: "status-connected", text: "\u2705 connected to Google Drive" });
@@ -1400,7 +1550,7 @@ var DriveEmbedderSettingTab = class extends import_obsidian4.PluginSettingTab {
       statusDiv.createSpan({ cls: "status-disconnected", text: "\u274C not connected" });
     }
     if (isConnected) {
-      new import_obsidian4.Setting(connectionDiv).setName("Disconnect").setDesc("disconnect from Google Drive").addButton(
+      new import_obsidian5.Setting(connectionDiv).setName("Disconnect").setDesc("disconnect from Google Drive").addButton(
         (button) => button.setButtonText("Disconnect").setWarning().onClick(() => {
           void this.plugin.disconnectGoogleDrive().then(() => {
             this.display();
@@ -1408,7 +1558,7 @@ var DriveEmbedderSettingTab = class extends import_obsidian4.PluginSettingTab {
         })
       );
     } else {
-      new import_obsidian4.Setting(connectionDiv).setName("Connect to Google Drive").setDesc("enter OAuth settings below, then click Connect").addButton(
+      new import_obsidian5.Setting(connectionDiv).setName("Connect to Google Drive").setDesc("enter OAuth settings below, then click Connect").addButton(
         (button) => button.setButtonText("Connect").setCta().onClick(() => {
           void this.plugin.startOAuthFlow().then((success) => {
             if (success) {
@@ -1420,14 +1570,14 @@ var DriveEmbedderSettingTab = class extends import_obsidian4.PluginSettingTab {
     }
   }
   createOAuthSection(containerEl) {
-    new import_obsidian4.Setting(containerEl).setName("Google OAuth").setHeading();
-    new import_obsidian4.Setting(containerEl).setName("Client ID").setDesc("OAuth client ID from Google Cloud Console").addText(
+    new import_obsidian5.Setting(containerEl).setName("Google OAuth").setHeading();
+    new import_obsidian5.Setting(containerEl).setName("Client ID").setDesc("OAuth client ID from Google Cloud Console").addText(
       (text) => text.setPlaceholder("xxx.apps.googleusercontent.com").setValue(this.plugin.settings.googleClientId).onChange((value) => {
         this.plugin.settings.googleClientId = value;
         void this.plugin.saveSettings();
       })
     );
-    new import_obsidian4.Setting(containerEl).setName("Client secret").setDesc("OAuth client secret from Google Cloud Console").addText(
+    new import_obsidian5.Setting(containerEl).setName("Client secret").setDesc("OAuth client secret from Google Cloud Console").addText(
       (text) => text.setPlaceholder("GOCSPX-...").setValue(this.plugin.settings.googleClientSecret).onChange((value) => {
         this.plugin.settings.googleClientSecret = value;
         void this.plugin.saveSettings();
@@ -1435,48 +1585,54 @@ var DriveEmbedderSettingTab = class extends import_obsidian4.PluginSettingTab {
     );
   }
   createDriveSection(containerEl) {
-    new import_obsidian4.Setting(containerEl).setName("Google Drive").setHeading();
-    new import_obsidian4.Setting(containerEl).setName("Upload folder").setDesc("Google Drive folder path for uploaded files").addText(
+    new import_obsidian5.Setting(containerEl).setName("Google Drive").setHeading();
+    new import_obsidian5.Setting(containerEl).setName("Upload folder").setDesc("Google Drive folder path for uploaded files").addText(
       (text) => text.setPlaceholder("Obsidian/DriveEmbedder").setValue(this.plugin.settings.driveFolder).onChange((value) => {
         this.plugin.settings.driveFolder = value;
         void this.plugin.saveSettings();
       })
     );
+    new import_obsidian5.Setting(containerEl).setName("Upload pasted images").setDesc("when you paste an image into a note, ask whether to upload it to Google Drive or save it in the vault").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.uploadPastedImages).onChange((value) => {
+        this.plugin.settings.uploadPastedImages = value;
+        void this.plugin.saveSettings();
+      })
+    );
   }
   createEmbedSection(containerEl) {
-    new import_obsidian4.Setting(containerEl).setName("Embed defaults").setHeading();
-    new import_obsidian4.Setting(containerEl).setName("Show filename by default").setDesc("display filename in embed code by default").addToggle(
+    new import_obsidian5.Setting(containerEl).setName("Embed defaults").setHeading();
+    new import_obsidian5.Setting(containerEl).setName("Show filename by default").setDesc("display filename in embed code by default").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.showTitleByDefault).onChange((value) => {
         this.plugin.settings.showTitleByDefault = value;
         void this.plugin.saveSettings();
       })
     );
-    new import_obsidian4.Setting(containerEl).setName("Default theme").setDesc("default embed theme (auto-detects system theme)").addDropdown(
+    new import_obsidian5.Setting(containerEl).setName("Default theme").setDesc("default embed theme (auto-detects system theme)").addDropdown(
       (dropdown) => dropdown.addOption("auto", "Auto (follows system)").addOption("light", "Light").addOption("dark", "Dark").setValue(this.plugin.settings.defaultTheme).onChange((value) => {
         this.plugin.settings.defaultTheme = value;
         void this.plugin.saveSettings();
       })
     );
-    new import_obsidian4.Setting(containerEl).setName("Default embed size").setHeading();
-    new import_obsidian4.Setting(containerEl).setName("Default video size").addDropdown(
+    new import_obsidian5.Setting(containerEl).setName("Default embed size").setHeading();
+    new import_obsidian5.Setting(containerEl).setName("Default video size").addDropdown(
       (dropdown) => dropdown.addOption("compact", "Compact").addOption("medium", "Medium").addOption("large", "Large").addOption("fullwidth", "Full width").setValue(this.plugin.settings.defaultVideoSize).onChange((value) => {
         this.plugin.settings.defaultVideoSize = value;
         void this.plugin.saveSettings();
       })
     );
-    new import_obsidian4.Setting(containerEl).setName("Default audio size").addDropdown(
+    new import_obsidian5.Setting(containerEl).setName("Default audio size").addDropdown(
       (dropdown) => dropdown.addOption("slim", "Slim").addOption("standard", "Standard").setValue(this.plugin.settings.defaultAudioSize).onChange((value) => {
         this.plugin.settings.defaultAudioSize = value;
         void this.plugin.saveSettings();
       })
     );
-    new import_obsidian4.Setting(containerEl).setName("Default document size").addDropdown(
+    new import_obsidian5.Setting(containerEl).setName("Default document size").addDropdown(
       (dropdown) => dropdown.addOption("compact", "Compact").addOption("medium", "Medium").addOption("large", "Large").addOption("fullheight", "Full height").setValue(this.plugin.settings.defaultDocumentSize).onChange((value) => {
         this.plugin.settings.defaultDocumentSize = value;
         void this.plugin.saveSettings();
       })
     );
-    new import_obsidian4.Setting(containerEl).setName("Default image size").addDropdown(
+    new import_obsidian5.Setting(containerEl).setName("Default image size").addDropdown(
       (dropdown) => dropdown.addOption("small", "Small").addOption("medium", "Medium").addOption("large", "Large").addOption("original", "Original size").setValue(this.plugin.settings.defaultImageSize).onChange((value) => {
         this.plugin.settings.defaultImageSize = value;
         void this.plugin.saveSettings();
@@ -1484,7 +1640,7 @@ var DriveEmbedderSettingTab = class extends import_obsidian4.PluginSettingTab {
     );
   }
   createHelpSection(containerEl) {
-    new import_obsidian4.Setting(containerEl).setName("Help").setHeading();
+    new import_obsidian5.Setting(containerEl).setName("Help").setHeading();
     const helpDiv = containerEl.createDiv({ cls: "drive-embedder-help" });
     const oauthDetails = helpDiv.createEl("details");
     const oauthSummary = oauthDetails.createEl("summary");
